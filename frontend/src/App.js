@@ -1,90 +1,174 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import './App.css';
 
-const GATEWAY = 'http://localhost:8000';
-const SERVICES = ['station', 'detect', 'control'];
-
-// mapping from service to a function which fetches additional info
-const DETAIL_ENDPOINT = {
-  station: '/station/api/status',       // returns running info / or custom
-  detect: '/detect/status-json',        // returns people/status
-  control: '/control/api/status',       // returns monitoring/counters
+const endpointMap = {
+  station: [
+    { name: 'Video feed', path: '/station/video_feed', type: 'stream' },
+    { name: 'Alerts (JSON)', path: '/station/alerts', type: 'json' },
+    { name: 'Status (JSON)', path: '/station/status', type: 'json' }
+  ],
+  detect: [
+    { name: 'Room stream', path: '/detect/status', type: 'stream' },
+    { name: 'Snapshot (JSON)', path: '/detect/status-json', type: 'json' },
+    { name: 'SSE events', path: '/detect/status-stream', type: 'sse' }
+  ],
+  control: [
+    { name: 'Entry cam', path: '/control/video_feed_entry', type: 'stream' },
+    { name: 'Exit cam', path: '/control/video_feed_exit', type: 'stream' },
+    { name: 'Status (JSON)', path: '/control/status', type: 'json' },
+    { name: 'People list', path: '/control/people', type: 'json' },
+    { name: 'Activity log', path: '/control/activity', type: 'json' }
+  ]
 };
 
 function App() {
-  const [status, setStatus] = useState({});
-  const [details, setDetails] = useState({});
-
-  const fetchStatus = () => {
-    fetch(`${GATEWAY}/status`)
-      .then(r => r.json())
-      .then(st => {
-        setStatus(st);
-        // after we know which services are running, pull their detail endpoints
-        Object.keys(DETAIL_ENDPOINT).forEach(name => {
-          if (st[name]?.running) {
-            fetch(`${GATEWAY}${DETAIL_ENDPOINT[name]}`)
-              .then(r => r.json())
-              .then(data => setDetails(d => ({ ...d, [name]: data })))
-              .catch(() => {});
-          }
-        });
-      })
-      .catch(e => console.error('gateway status error', e));
-  };
+  const [server, setServer] = useState('station');
+  const [streamSrc, setStreamSrc] = useState('');
+  const [output, setOutput] = useState('');
+  const [autoData, setAutoData] = useState({});
+  const [starting, setStarting] = useState(false);
+  const eventSourceRef = useRef(null);
 
   useEffect(() => {
-    fetchStatus();
-    const iv = setInterval(fetchStatus, 5000);
-    return () => clearInterval(iv);
-  }, []);
+    return () => {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+    };
+  }, [server]);
 
-  const sendAction = (name, action) => () => {
-    fetch(`${GATEWAY}/${action}/${name}`, { method: 'POST' })
-      .then(fetchStatus)
-      .catch(e => console.error(e));
+  useEffect(() => {
+    setAutoData({});
+    if (!streamSrc) return;
+
+    const endpoints = endpointMap[server] || [];
+    const jsonEps = endpoints.filter(ep => ep.type === 'json');
+
+    const interval = setInterval(() => {
+      jsonEps.forEach(ep => {
+        fetch(ep.path)
+          .then(r => r.json())
+          .then(j => {
+            setAutoData(prev => ({ ...prev, [ep.name]: j }));
+          })
+          .catch(() => {});
+      });
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [server, streamSrc]);
+
+  const wait = (ms) => new Promise(r => setTimeout(r, ms));
+
+  const startProcessOnly = async () => {
+    setStarting(true);
+    try {
+      await fetch(`/start/${server}`, { method: 'POST' });
+      await wait(2500); // wait for Flask server to boot
+      return true;
+    } catch (err) {
+      setOutput('Process start failed: ' + err.toString());
+      return false;
+    } finally {
+      setStarting(false);
+    }
   };
 
-  return (
-    <div style={{ padding: '1rem', fontFamily: 'sans-serif' }}>
-      <h1>Integrated App Gateway</h1>
-      {SERVICES.map(name => (
-        <div key={name} style={{ marginBottom: '1.5rem', border: '1px solid #ccc', padding: '0.5rem' }}>
-          <h2 style={{ textTransform: 'capitalize' }}>{name}</h2>
-          <p>running: {String(status[name]?.running)}</p>
-          <button onClick={sendAction(name, 'start')} disabled={status[name]?.running}>Start</button>{' '}
-          <button onClick={sendAction(name, 'stop')} disabled={!status[name]?.running}>Stop</button>
-          <div>
-            <strong>port:</strong> {status[name]?.port}
-          </div>
-          <div>
-            <strong>networks:</strong> {status[name]?.networks?.join(', ')}
-          </div>
-          {details[name] && (
-            <pre style={{ background: '#f9f9f9', padding: '0.5rem' }}>
-              {JSON.stringify(details[name], null, 2)}
-            </pre>
-          )}
-        </div>
-      ))}
+  const handleEndpoint = async (ep) => {
+    setStreamSrc('');
+    setOutput('');
 
-      <h2>Streams (via gateway)</h2>
-      <div style={{ display: 'flex', gap: '1rem' }}>
-        <div>
-          <h3>Control entry</h3>
-          <img src={`${GATEWAY}/control/video_feed_entry`} alt="entry cam" width={320} />
-        </div>
-        <div>
-          <h3>Control exit</h3>
-          <img src={`${GATEWAY}/control/video_feed_exit`} alt="exit cam" width={320} />
-        </div>
+    if (ep.type === 'stream') {
+      const started = await startProcessOnly();
+      if (!started) return;
+
+      setStreamSrc(ep.path);
+      return;
+    }
+
+    try {
+      const res = await fetch(ep.path);
+      const data = await res.json();
+      setOutput(JSON.stringify(data, null, 2));
+    } catch (err) {
+      setOutput('error: ' + err.toString());
+    }
+  };
+
+  const available = endpointMap[server] || [];
+
+  return (
+    <div className="app">
+      <h1>Model Gateway Control</h1>
+
+      <div className="controls">
+        <label>
+          Select server:{' '}
+          <select value={server} onChange={e => setServer(e.target.value)}>
+            <option value="station">Station</option>
+            <option value="detect">Detect</option>
+            <option value="control">Control</option>
+          </select>
+        </label>
+
+        <button
+          disabled={starting}
+          onClick={() => fetch(`/start/${server}`, { method: 'POST' })}
+        >
+          {starting ? 'Starting…' : 'Start Process'}
+        </button>
+
+        <button disabled={starting} onClick={() => fetch(`/stop/${server}`, { method: 'POST' })}>
+          Stop Process
+        </button>
+
+        <button
+          disabled={starting}
+          onClick={() =>
+            fetch('/status')
+              .then(r => r.json())
+              .then(j => setOutput(JSON.stringify(j, null, 2)))
+          }
+        >
+          Gateway Status
+        </button>
       </div>
-      <div style={{ marginTop: '1rem' }}>
-        <h3>Station feed</h3>
-        <img src={`${GATEWAY}/station/video_feed`} alt="station" width={640} />
+
+      <h2>Server endpoints</h2>
+      <div className="endpoints">
+        {available.map(ep => (
+          <button
+            key={ep.path}
+            onClick={() => handleEndpoint(ep)}
+          >
+            {ep.name}
+          </button>
+        ))}
       </div>
-      <div style={{ marginTop: '1rem' }}>
-        <h3>Detect feed</h3>
-        <img src={`${GATEWAY}/detect/status`} alt="detect" width={640} />
+
+      {streamSrc && (
+        <div className="stream-section">
+          <h3>Stream</h3>
+          <img src={streamSrc} alt="stream" />
+        </div>
+      )}
+
+      {Object.keys(autoData).length > 0 && (
+        <div className="live-section">
+          <h3>Live status / alerts</h3>
+          {Object.entries(autoData).map(([name, data]) => (
+            <div key={name}>
+              <strong>{name}:</strong>
+              <pre>{JSON.stringify(data, null, 2)}</pre>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="output-section">
+        <h2>Response</h2>
+        <pre>{output || '(click a button)'}</pre>
       </div>
     </div>
   );

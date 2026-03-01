@@ -4,3 +4,10 @@ requests
 numpy
 opencv-python
 axelera
+
+
+
+
+# pkill -f 4_ppl_server
+# pkill -f station_in_order_server
+# pkill -f control_room

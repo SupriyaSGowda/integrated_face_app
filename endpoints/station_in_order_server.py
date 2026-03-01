@@ -1,67 +1,85 @@
 #!/usr/bin/env python3
 
 # bring workspace root onto sys.path so the logic package can be imported
-import os, sys
+import os
+import sys
+import threading
+import time
+import signal
+import argparse
+from flask import Flask, Response, jsonify
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from flask import Flask, Response, jsonify
-import threading
-import time
 from logic import face_app
-import atexit
 
 app = Flask(__name__)
 
-# =========================================
-# START BACKGROUND INFERENCE (SAFE START)
-# =========================================
-inference_thread_started = False
-inference_lock = threading.Lock()
+# =========================================================
+# GLOBAL STATE
+# =========================================================
 inference_thread = None
+inference_lock = threading.Lock()
+shutdown_event = threading.Event()
 
 
-def ensure_inference_running():
-    global inference_thread_started, inference_thread
+# =========================================================
+# SAFE INFERENCE START
+# =========================================================
+def start_inference():
+    global inference_thread
 
     with inference_lock:
-        if not inference_thread_started:
-            inference_thread = threading.Thread(
-                target=face_app.background_inference_loop,
-                daemon=True
-            )
-            inference_thread.start()
-            inference_thread_started = True
+        if inference_thread and inference_thread.is_alive():
+            return
+
+        def run_loop():
             print("🔥 Inference thread started")
+            try:
+                face_app.background_inference_loop()
+            except Exception as e:
+                print("❌ Inference crashed:", e)
+
+        inference_thread = threading.Thread(
+            target=run_loop,
+            daemon=True
+        )
+        inference_thread.start()
 
 
-# Start immediately when module loads (safe in Flask 3)
-ensure_inference_running()
+# =========================================================
+# CLEAN SHUTDOWN
+# =========================================================
+def graceful_shutdown(signum=None, frame=None):
+    print("🛑 Station server shutting down...")
+    shutdown_event.set()
+
+    # If your face_app has a stop flag, trigger it here
+    if hasattr(face_app, "STOP_EVENT"):
+        face_app.STOP_EVENT.set()
+
+    time.sleep(1)
+    os._exit(0)
 
 
-# =========================================
-# CLEAN SHUTDOWN HANDLER
-# =========================================
-def cleanup():
-    print("🛑 Flask shutting down...")
-
-atexit.register(cleanup)
+signal.signal(signal.SIGTERM, graceful_shutdown)
+signal.signal(signal.SIGINT, graceful_shutdown)
 
 
-# =========================================
-# MJPEG STREAM (OPTIMIZED)
-# =========================================
+# =========================================================
+# MJPEG STREAM
+# =========================================================
 def mjpeg_stream():
     last_frame = None
 
-    while True:
+    while not shutdown_event.is_set():
         try:
             frame = face_app.get_last_frame_jpeg()
 
             if frame and frame != last_frame:
                 last_frame = frame
-
                 yield (
                     b'--frame\r\n'
                     b'Content-Type: image/jpeg\r\n\r\n' +
@@ -71,7 +89,6 @@ def mjpeg_stream():
 
         except GeneratorExit:
             break
-
         except Exception as e:
             print("⚠ Stream error:", e)
             time.sleep(0.1)
@@ -79,9 +96,6 @@ def mjpeg_stream():
         time.sleep(0.01)
 
 
-# =========================================
-# VIDEO FEED
-# =========================================
 @app.route("/video_feed")
 def video_feed():
     return Response(
@@ -96,18 +110,17 @@ def video_feed():
     )
 
 
-# =========================================
+# =========================================================
 # ALERT API
-# =========================================
+# =========================================================
 @app.route("/alerts")
 def api_alerts():
     try:
         alerts = face_app.get_alerts()
 
-        if alerts:
-            if hasattr(face_app, "_ALERT_LOCK"):
-                with face_app._ALERT_LOCK:
-                    face_app.LAST_ALERTS.clear()
+        if alerts and hasattr(face_app, "_ALERT_LOCK"):
+            with face_app._ALERT_LOCK:
+                face_app.LAST_ALERTS.clear()
 
         return jsonify({
             "count": len(alerts),
@@ -119,9 +132,9 @@ def api_alerts():
         return jsonify({"error": str(e)}), 500
 
 
-# =========================================
+# =========================================================
 # STATUS API
-# =========================================
+# =========================================================
 @app.route("/status")
 def api_status():
     return jsonify({
@@ -132,24 +145,24 @@ def api_status():
     })
 
 
-# =========================================
+# =========================================================
 # HEALTH CHECK
-# =========================================
+# =========================================================
 @app.route("/health")
 def health():
     return jsonify({"status": "running"})
 
 
-# =========================================
+# =========================================================
 # RUN SERVER
-# =========================================
+# =========================================================
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(description="Station inference HTTP server")
-    parser.add_argument("--port", type=int, default=5001,
-                        help="port to bind the Flask app")
+    parser.add_argument("--port", type=int, default=5001)
     args = parser.parse_args()
+
+    # 🔥 START INFERENCE ONLY HERE
+    start_inference()
 
     app.run(
         host="0.0.0.0",

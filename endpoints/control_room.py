@@ -8,6 +8,7 @@ if ROOT not in sys.path:
 
 import threading
 import cv2
+import time
 from flask import Flask, jsonify, Response
 from flask_cors import CORS
 from logic import track_room
@@ -19,28 +20,31 @@ monitor_thread = None
 
 
 # =========================
-# START MONITORING
+# HELPER
 # =========================
-@app.route("/start", methods=["POST", "GET"])
-def start_monitoring():
+def is_monitoring_running():
+    return monitor_thread is not None and monitor_thread.is_alive()
+
+
+def start_monitoring_thread():
     global monitor_thread
 
-    if monitor_thread is None or not monitor_thread.is_alive():
-        monitor_thread = threading.Thread(
-            target=track_room.track_room,
-            daemon=True
-        )
-        monitor_thread.start()
+    if is_monitoring_running():
+        return
 
-        return jsonify({
-            "success": True,
-            "message": "Monitoring started"
-        })
+    print("🔥 Starting monitoring thread...")
 
-    return jsonify({
-        "success": False,
-        "message": "Already running"
-    }), 409
+    def safe_runner():
+        try:
+            track_room.track_room()
+        except Exception as e:
+            print("❌ TRACK ROOM CRASHED:", e)
+
+    monitor_thread = threading.Thread(
+        target=safe_runner,
+        daemon=True
+    )
+    monitor_thread.start()
 
 
 # =========================
@@ -49,26 +53,26 @@ def start_monitoring():
 @app.route("/status", methods=["GET"])
 def get_status():
     return jsonify({
-        "monitoring": monitor_thread is not None and monitor_thread.is_alive(),
+        "monitoring": is_monitoring_running(),
         "totalInside": len(track_room.present_people),
         "lastEntryDetection": track_room.last_entry_detection,
         "lastExitDetection": track_room.last_exit_detection
     })
 
 
-# =====================================================
-# Known people (defaults, can be extended by recognitions)
-# =====================================================
-DEFAULT_PEOPLE = ["Hrithik", "Supriya", "Anirudh", "Meenakshi"]
-
 # =========================
 # PEOPLE LIST
 # =========================
+DEFAULT_PEOPLE = ["Hrithik", "Supriya", "Anirudh", "Meenakshi"]
+
 @app.route("/people", methods=["GET"])
 def get_people():
-    # start with the default roster but merge in any names that have been
-    # seen by the tracker (entry/exit timestamps or currently present).
-    names = set(DEFAULT_PEOPLE) | set(track_room.entry_times.keys()) | set(track_room.exit_times.keys()) | set(track_room.present_people)
+    names = (
+        set(DEFAULT_PEOPLE)
+        | set(track_room.entry_times.keys())
+        | set(track_room.exit_times.keys())
+        | set(track_room.present_people)
+    )
 
     people_list = []
 
@@ -90,7 +94,6 @@ def get_people():
 # =========================
 @app.route("/activity", methods=["GET"])
 def get_activity():
-    # return a copy so the list can still be mutated by the tracker thread
     return jsonify(list(track_room.activity_log))
 
 
@@ -99,13 +102,13 @@ def get_activity():
 # =========================
 @app.route("/video_feed_entry")
 def video_feed_entry():
-    return Response(generate_entry_stream(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(
+        generate_entry_stream(),
+        mimetype='multipart/x-mixed-replace; boundary=frame'
+    )
 
 
 def generate_entry_stream():
-    import time
-
     while True:
         frame = track_room.latest_frame_entry
 
@@ -115,14 +118,13 @@ def generate_entry_stream():
 
         ret, buffer = cv2.imencode('.jpg', frame)
         if not ret:
-            time.sleep(0.01)
             continue
 
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' +
                buffer.tobytes() + b'\r\n')
 
-        time.sleep(0.03)   # ~30 FPS cap
+        time.sleep(0.03)
 
 
 # =========================
@@ -130,13 +132,13 @@ def generate_entry_stream():
 # =========================
 @app.route("/video_feed_exit")
 def video_feed_exit():
-    return Response(generate_exit_stream(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(
+        generate_exit_stream(),
+        mimetype='multipart/x-mixed-replace; boundary=frame'
+    )
 
 
 def generate_exit_stream():
-    import time
-
     while True:
         frame = track_room.latest_frame_exit
 
@@ -146,7 +148,6 @@ def generate_exit_stream():
 
         ret, buffer = cv2.imencode('.jpg', frame)
         if not ret:
-            time.sleep(0.01)
             continue
 
         yield (b'--frame\r\n'
@@ -155,17 +156,6 @@ def generate_exit_stream():
 
         time.sleep(0.03)
 
-# =========================
-# STOP (Still placeholder)
-# =========================
-@app.route("/stop", methods=["POST"])
-def stop_monitoring():
-    # thread cannot be cleanly terminated at the moment
-    return jsonify({
-        "success": True,
-        "message": "Stop request received (thread continues to run)"
-    })
-
 
 # =========================
 # HEALTH
@@ -173,7 +163,8 @@ def stop_monitoring():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
-        "status": "OK"
+        "status": "OK",
+        "monitoring": is_monitoring_running()
     })
 
 
@@ -187,6 +178,12 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=5003,
                         help="port to bind the Flask app")
     args = parser.parse_args()
+
+    # 🔥 AUTO START MONITORING WHEN PROCESS BOOTS
+    start_monitoring_thread()
+
+    # Give it a second to initialize
+    time.sleep(2)
 
     print(f"🚀 Flask Server Running on http://localhost:{args.port}")
     app.run(host="0.0.0.0", port=args.port, debug=False, threaded=True)
